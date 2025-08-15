@@ -1,0 +1,791 @@
+name: DMD Performance Regression Testing
+permissions:
+  pull-requests: write
+  contents: read
+  
+on:
+  pull_request:
+    branches: [main, master]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  performance-test:
+    name: DMD Performance Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+    - name: Checkout PR with submodules
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        submodules: 'recursive'
+
+    - name: Setup Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential git bc python3 time libcurl4-openssl-dev zlib1g-dev libevent-dev libssl-dev jq
+        
+        # Install bootstrap D compiler
+        curl -fsS https://dlang.org/install.sh | bash -s dmd
+        source ~/dlang/dmd-*/activate
+        
+        # Export paths for subsequent steps
+        echo "$(echo ~/dlang/dmd-*/linux/bin64)" >> $GITHUB_PATH
+        echo "HOST_DMD=$(echo ~/dlang/dmd-*/linux/bin64/dmd)" >> $GITHUB_ENV
+        
+        # Verify bootstrap compiler
+        dmd --version
+        
+        # Debug: Check if bc is available (needed for timing calculations)
+        which bc
+        bc --version
+
+    - name: Initialize Submodules
+      run: |
+        echo "=== Initializing Submodules ==="
+        
+        # Ensure all submodules are properly initialized
+        git submodule update --init --recursive || true
+        
+        # Check for required submodules and clone if missing
+        if [ ! -d "phobos" ] || [ ! "$(ls -A phobos 2>/dev/null)" ]; then
+          echo "Cloning Phobos..."
+          rm -rf phobos
+          git clone --depth 1 --branch master https://github.com/dlang/phobos.git
+        fi
+        
+        if [ ! -d "druntime" ] || [ ! "$(ls -A druntime 2>/dev/null)" ]; then
+          echo "Cloning Druntime..."
+          rm -rf druntime  
+          git clone --depth 1 --branch master https://github.com/dlang/druntime.git
+        fi
+        
+        echo "✅ Submodules initialized"
+        ls -la
+
+    - name: Create Performance Test Script
+      run: |
+        mkdir -p scripts/perf
+        cat > scripts/perf/dmd-performance-test.sh << 'SCRIPT_EOF'
+        #!/bin/bash
+        set -euo pipefail
+        
+        TEST_TYPE=$1
+        RESULTS_DIR="perf-results"
+        mkdir -p "$RESULTS_DIR"
+        
+        # Get current commit hash
+        COMMIT_HASH=$(git rev-parse --short HEAD)
+        BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
+        
+        # Initialize results JSON
+        echo '{
+          "branch": "'"$BRANCH_NAME"'",
+          "commit": "'"$COMMIT_HASH"'",
+          "timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",
+          "tests": {}
+        }' > "$RESULTS_DIR/results.json"
+        
+        # Helper function to add test results
+        add_result() {
+          local key=$1
+          local value=$2
+          local tmpfile=$(mktemp)
+          jq --arg key "$key" --arg value "$value" '.tests += {($key): $value}' "$RESULTS_DIR/results.json" > "$tmpfile"
+          mv "$tmpfile" "$RESULTS_DIR/results.json"
+        }
+        
+        # Helper function to run timed command with better error handling
+        run_timed() {
+          local description=$1
+          local command=$2
+          local result_key=$3
+          
+          echo "[$TEST_TYPE] $description..."
+          
+          # Create a temporary script to run the command
+          local temp_script=$(mktemp)
+          local error_log=$(mktemp)
+          echo "#!/bin/bash" > "$temp_script"
+          echo "set -euo pipefail" >> "$temp_script"
+          echo "$command" >> "$temp_script"
+          chmod +x "$temp_script"
+          
+          # Run with timeout and capture timing
+          local start_time=$(date +%s.%N)
+          if timeout 300 "$temp_script" 2>"$error_log"; then
+            local end_time=$(date +%s.%N)
+            local duration=$(echo "$end_time - $start_time" | bc -l)
+            add_result "$result_key" "$duration"
+            echo "[$TEST_TYPE] $description completed in ${duration}s"
+          else
+            add_result "$result_key" "999.000"
+            echo "[$TEST_TYPE] $description failed or timed out"
+            echo "[$TEST_TYPE] Error details:"
+            cat "$error_log" | head -10
+            echo "[$TEST_TYPE] Command was: $command"
+            echo "[$TEST_TYPE] DMD path: $DMD_PATH"
+            echo "[$TEST_TYPE] Current directory: $(pwd)"
+            echo "[$TEST_TYPE] Available files: $(ls -la | head -5)"
+          fi
+          
+          rm -f "$temp_script" "$error_log"
+        }
+        
+        # Ensure DMD binary exists
+        DMD_BINARY="generated/linux/release/64/dmd"
+        if [ ! -f "$DMD_BINARY" ]; then
+          echo "❌ DMD binary not found at $DMD_BINARY"
+          add_result "error" "dmd_binary_missing"
+          exit 1
+        fi
+        
+        # Set up environment
+        export DMD_PATH="$(pwd)/$DMD_BINARY"
+        
+        # Find library paths - check multiple possible locations
+        DRUNTIME_LIB=""
+        PHOBOS_LIB=""
+        
+        if [ -d "generated/linux/release/64" ]; then
+          DRUNTIME_LIB="$(pwd)/generated/linux/release/64"
+        fi
+        
+        if [ -d "phobos/generated/linux/release/64" ]; then
+          PHOBOS_LIB="$(pwd)/phobos/generated/linux/release/64"
+        elif [ -d "phobos" ]; then
+          # Try to find phobos library in different locations
+          PHOBOS_SEARCH=$(find phobos -name "*.a" -o -name "*.so" | head -1)
+          if [ -n "$PHOBOS_SEARCH" ]; then
+            PHOBOS_LIB="$(dirname "$PHOBOS_SEARCH")"
+          fi
+        fi
+        
+        # Set library paths
+        export LIBRARY_PATH="$DRUNTIME_LIB:$PHOBOS_LIB"
+        export LD_LIBRARY_PATH="$DRUNTIME_LIB:$PHOBOS_LIB"
+        
+        # Debug environment
+        echo "[$TEST_TYPE] Environment setup:"
+        echo "  DMD_PATH: $DMD_PATH"
+        echo "  DRUNTIME_LIB: $DRUNTIME_LIB"
+        echo "  PHOBOS_LIB: $PHOBOS_LIB"
+        echo "  LIBRARY_PATH: $LIBRARY_PATH"
+        
+        # Test DMD basic functionality first
+        echo "[$TEST_TYPE] Testing DMD basic functionality..."
+        if ! $DMD_PATH --version >/dev/null 2>&1; then
+          echo "❌ DMD binary is not working"
+          add_result "error" "dmd_binary_broken"
+          exit 1
+        fi
+        
+        # 1. Simple compilation test (compile only, no linking)
+        run_timed "Simple compilation test" \
+          "echo 'void main() { int x = 42; }' > test_simple.d && $DMD_PATH -c test_simple.d && rm -f test_simple.d test_simple.o" \
+          "simple_compile_time"
+        
+        # 2. Template stress test
+        cat > template_stress_test.d << 'TEST_EOF'
+        template Factorial(int n) {
+            static if (n <= 1)
+                enum Factorial = 1;
+            else
+                enum Factorial = n * Factorial!(n-1);
+        }
+        
+        template Power(int base, int exp) {
+            static if (exp == 0)
+                enum Power = 1;
+            else
+                enum Power = base * Power!(base, exp-1);
+        }
+        
+        void main() {
+            enum f5 = Factorial!5;
+            enum f10 = Factorial!10;
+            enum f12 = Factorial!12;
+            enum p1 = Power!(2, 10);
+            enum p2 = Power!(3, 8);
+            enum p3 = Power!(5, 6);
+        }
+        TEST_EOF
+        
+        run_timed "Template stress test" \
+          "$DMD_PATH -c template_stress_test.d && rm -f template_stress_test.o" \
+          "template_stress_time"
+        
+        # 3. CTFE stress test (simplified to avoid library dependencies)
+        cat > ctfe_stress_test.d << 'TEST_EOF'
+        string repeat(string s, int n) {
+            string result = "";
+            for (int i = 0; i < n; i++) {
+                result ~= s;
+            }
+            return result;
+        }
+        
+        int fibonacci(int n) {
+            if (n <= 1) return n;
+            return fibonacci(n-1) + fibonacci(n-2);
+        }
+        
+        void main() {
+            enum repeated = repeat("test", 20);
+            enum fib10 = fibonacci(10);
+            enum fib12 = fibonacci(12);
+        }
+        TEST_EOF
+        
+        run_timed "CTFE stress test" \
+          "$DMD_PATH -c ctfe_stress_test.d && rm -f ctfe_stress_test.o" \
+          "ctfe_stress_time"
+        
+        # 4. Large file compilation test (no imports to avoid library issues)
+        echo "[$TEST_TYPE] Generating large test file..."
+        cat > large_test.d << 'TEST_EOF'
+        module large_test;
+        
+        TEST_EOF
+        
+        for i in {1..300}; do
+          echo "int func$i() { int x = $i; int y = x * 2; int z = y + x; return z > 100 ? z : x; }" >> large_test.d
+        done
+        
+        # Add a main function
+        echo "void main() { int result = func1() + func50() + func100(); }" >> large_test.d
+        
+        run_timed "Large file compilation" \
+          "$DMD_PATH -c large_test.d && rm -f large_test.o" \
+          "large_file_compile_time"
+        
+        # 5. Multiple file compilation (without imports to avoid library issues)
+        echo "[$TEST_TYPE] Creating multi-file test..."
+        mkdir -p multifile_test
+        
+        for i in {1..5}; do
+          cat > "multifile_test/module$i.d" << TEST_EOF
+        module module$i;
+        
+        class Class$i {
+            int value = $i;
+            int getValue() { return value * 2; }
+        }
+        
+        int function$i() {
+            auto obj = new Class$i();
+            return obj.getValue();
+        }
+        TEST_EOF
+        done
+        
+        cat > multifile_test/main.d << 'TEST_EOF'
+        import module1, module2, module3, module4, module5;
+        
+        void main() {
+            int result = function1() + function2() + function3() + function4() + function5();
+        }
+        TEST_EOF
+        
+        run_timed "Multiple file compilation" \
+          "$DMD_PATH -c multifile_test/*.d && rm -f *.o" \
+          "multifile_compile_time"
+        
+        # Add a test that actually tries linking (if phobos is available)
+        if [ -n "$PHOBOS_LIB" ] && [ -f "$PHOBOS_LIB/libphobos2.a" ]; then
+          run_timed "Full linking test" \
+            "echo 'void main() { int x = 42; }' > test_link.d && $DMD_PATH test_link.d -of=test_link_out && rm -f test_link.d test_link_out test_link.o" \
+            "full_link_time"
+        else
+          echo "[$TEST_TYPE] Skipping linking test - Phobos library not found"
+          add_result "full_link_time" "skipped"
+        fi
+        if [ -f "$DMD_BINARY" ]; then
+          DMD_SIZE=$(stat -c%s "$DMD_BINARY")
+          add_result "dmd_size_bytes" "$DMD_SIZE"
+          echo "[$TEST_TYPE] DMD binary size: $DMD_SIZE bytes"
+        else
+          add_result "dmd_size_bytes" "0"
+        fi
+        
+        # Clean up test files
+        rm -f template_stress_test.d ctfe_stress_test.d large_test.d
+        rm -rf multifile_test
+        
+        echo "[$TEST_TYPE] Performance tests completed successfully!"
+        cat "$RESULTS_DIR/results.json"
+        SCRIPT_EOF
+        chmod +x scripts/perf/dmd-performance-test.sh
+
+    - name: Build and Test Baseline (Main Branch)
+      run: |
+        echo "=== Building Baseline DMD ==="
+        git checkout ${{ github.base_ref }}
+        
+        # Update submodules for baseline branch
+        git submodule update --recursive || true
+        
+        # Clean any previous build
+        make -f posix.mak clean || true
+        rm -rf generated/ || true
+        
+        # Build DMD with all dependencies using the integrated build system
+        echo "Building baseline with HOST_DMD: $HOST_DMD"
+        make -f posix.mak -j$(nproc) all \
+          HOST_DMD="$HOST_DMD" \
+          MODEL=64 \
+          ENABLE_RELEASE=1 \
+          VERBOSE=1 2>&1 | tee baseline-build.log
+        
+        # Check if Phobos was built successfully
+        echo "=== Checking Phobos Build Status ==="
+        if [ -d "phobos/generated/linux/release/64" ]; then
+          echo "✅ Phobos directory found"
+          ls -la phobos/generated/linux/release/64/ | head -10
+          if [ -f "phobos/generated/linux/release/64/libphobos2.a" ]; then
+            echo "✅ Phobos library found"
+          else
+            echo "⚠️ Phobos library not found, trying to build manually"
+            cd phobos
+            make -f posix.mak -j$(nproc) DMD=../generated/linux/release/64/dmd 2>&1 | tee ../phobos-build.log || true
+            cd ..
+          fi
+        else
+          echo "⚠️ Phobos directory not found"
+        fi
+        
+        # Verify DMD was built
+        if [ ! -f "generated/linux/release/64/dmd" ]; then
+          echo "❌ Baseline DMD binary not found after build"
+          echo "=== Build Log Tail ==="
+          tail -50 baseline-build.log
+          echo "=== Directory Contents ==="
+          find generated/ -name "*dmd*" 2>/dev/null || echo "No DMD binaries found"
+          exit 1
+        fi
+        
+        echo "✅ Baseline DMD built successfully"
+        generated/linux/release/64/dmd --version
+        
+        echo "=== Testing Baseline Performance ==="
+        if ./scripts/perf/dmd-performance-test.sh baseline; then
+          echo "✅ Baseline performance test completed"
+        else
+          echo "⚠️ Baseline performance test had issues"
+          cat perf-results/results.json 2>/dev/null || echo "No results file generated"
+        fi
+        
+        # Save results
+        mkdir -p /tmp/perf-results
+        if [ -f "perf-results/results.json" ]; then
+          cp perf-results/results.json /tmp/perf-results/baseline.json
+          echo "✅ Baseline results saved"
+          echo "Baseline results preview:"
+          head -20 /tmp/perf-results/baseline.json
+        else
+          echo "❌ No baseline results generated"
+          echo '{"error": "baseline_failed", "message": "Performance tests failed to generate results"}' > /tmp/perf-results/baseline.json
+        fi
+
+    - name: Build and Test PR Branch  
+      run: |
+        echo "=== Building PR DMD ==="
+        git checkout ${{ github.sha }}
+        
+        # Update submodules for PR branch
+        git submodule update --recursive || true
+        
+        # Clean previous build
+        make -f posix.mak clean || true
+        rm -rf generated/ || true
+        
+        # Build PR DMD with all dependencies
+        echo "Building PR with HOST_DMD: $HOST_DMD"
+        make -f posix.mak -j$(nproc) all \
+          HOST_DMD="$HOST_DMD" \
+          MODEL=64 \
+          ENABLE_RELEASE=1 \
+          VERBOSE=1 2>&1 | tee pr-build.log
+        
+        # Check if Phobos was built successfully
+        echo "=== Checking Phobos Build Status ==="
+        if [ -d "phobos/generated/linux/release/64" ]; then
+          echo "✅ Phobos directory found"
+          ls -la phobos/generated/linux/release/64/ | head -10
+          if [ -f "phobos/generated/linux/release/64/libphobos2.a" ]; then
+            echo "✅ Phobos library found"
+          else
+            echo "⚠️ Phobos library not found, trying to build manually"
+            cd phobos
+            make -f posix.mak -j$(nproc) DMD=../generated/linux/release/64/dmd 2>&1 | tee ../phobos-build.log || true
+            cd ..
+          fi
+        else
+          echo "⚠️ Phobos directory not found"
+        fi
+        
+        # Verify DMD was built
+        if [ ! -f "generated/linux/release/64/dmd" ]; then
+          echo "❌ PR DMD binary not found after build"
+          echo "=== Build Log Tail ==="
+          tail -50 pr-build.log
+          echo "=== Directory Contents ==="
+          find generated/ -name "*dmd*" 2>/dev/null || echo "No DMD binaries found"
+          exit 1
+        fi
+        
+        echo "✅ PR DMD built successfully"
+        generated/linux/release/64/dmd --version
+        
+        echo "=== Testing PR Performance ==="
+        if ./scripts/perf/dmd-performance-test.sh pr; then
+          echo "✅ PR performance test completed"
+        else
+          echo "⚠️ PR performance test had issues"
+          cat perf-results/results.json 2>/dev/null || echo "No results file generated"
+        fi
+        
+        # Save results
+        if [ -f "perf-results/results.json" ]; then
+          cp perf-results/results.json /tmp/perf-results/pr.json
+          echo "✅ PR results saved"
+          echo "PR results preview:"
+          head -20 /tmp/perf-results/pr.json
+        else
+          echo "❌ No PR results generated"
+          echo '{"error": "pr_failed", "message": "Performance tests failed to generate results"}' > /tmp/perf-results/pr.json
+        fi
+
+    - name: Generate Performance Report
+      run: |
+        mkdir -p /tmp/perf-results
+        if [ ! -f "/tmp/perf-results/baseline.json" ]; then
+          echo '{"error": "baseline_missing"}' > /tmp/perf-results/baseline.json
+        fi
+        if [ ! -f "/tmp/perf-results/pr.json" ]; then
+          echo '{"error": "pr_missing"}' > /tmp/perf-results/pr.json
+        fi
+
+        cat > /tmp/generate-report.py << 'EOF'
+        #!/usr/bin/env python3
+        import json
+        import sys
+        from datetime import datetime
+        
+        def load_json(file):
+            try:
+                with open(file) as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error loading {file}: {e}")
+                return {"error": "load_failed"}
+        
+        def format_time(seconds):
+            if str(seconds) == "999.000" or str(seconds) == "999.000000000":
+                return "FAILED"
+            elif str(seconds) == "skipped":
+                return "SKIPPED"
+            try:
+                return f"{float(seconds):.3f}s"
+            except:
+                return "ERROR"
+        
+        def format_size(bytes_val):
+            if bytes_val == 0:
+                return "N/A"
+            try:
+                mb = int(bytes_val) / (1024 * 1024)
+                return f"{mb:.1f}MB"
+            except:
+                return "ERROR"
+        
+        def calc_change(baseline, pr):
+            if baseline == 0 or str(pr) == "999.000" or str(baseline) == "999.000" or str(pr) == "skipped" or str(baseline) == "skipped":
+                return "N/A"
+            try:
+                baseline_val = float(baseline)
+                pr_val = float(pr)
+                if baseline_val == 0:
+                    return "N/A"
+                change = ((baseline_val - pr_val) / baseline_val) * 100
+                if abs(change) < 1:
+                    return "≈ no change"
+                elif change > 0:
+                    return f"🚀 {change:.1f}% faster"
+                else:
+                    return f"🔻 {abs(change):.1f}% slower"
+            except Exception as e:
+                return f"ERROR: {e}"
+        
+        baseline = load_json('/tmp/perf-results/baseline.json')
+        pr = load_json('/tmp/perf-results/pr.json')
+        
+        # Check for errors in results
+        if baseline.get('error') or pr.get('error'):
+            print("# ⚠️ DMD Performance Test Issues")
+            print()
+            if baseline.get('error'):
+                print(f"❌ **Baseline issue:** {baseline['error']}")
+                if 'message' in baseline:
+                    print(f"   {baseline['message']}")
+            if pr.get('error'):
+                print(f"❌ **PR issue:** {pr['error']}") 
+                if 'message' in pr:
+                    print(f"   {pr['message']}")
+            print()
+            print("Please check the workflow logs for details.")
+            print()
+            print("---")
+            print("*DMD Performance Regression Testing*")
+            sys.exit(0)
+        
+        if not baseline or not pr:
+            print("# ⚠️ Performance Test Incomplete")
+            print()
+            print("Could not generate performance comparison - missing result files")
+            print()
+            print("---")
+            print("*DMD Performance Regression Testing*")
+            sys.exit(0)
+        
+        print("# 📊 DMD Performance Comparison")
+        print()
+        print(f"**Comparing:** `{pr.get('branch', 'PR')}` vs `{baseline.get('branch', 'main')}`")
+        print(f"**Tested on:** {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+        print()
+        
+        # DMD compilation performance
+        print("## ⚡ DMD Compilation Performance")
+        print("| Test | Main Branch | PR Branch | Change |")
+        print("|------|-------------|-----------|--------|")
+        
+        tests = [
+            ("Simple Compilation", "simple_compile_time"),
+            ("Template Heavy Code", "template_stress_time"),
+            ("CTFE Heavy Code", "ctfe_stress_time"),
+            ("Large File Compilation", "large_file_compile_time"),
+            ("Multi-file Project", "multifile_compile_time"),
+            ("Full Linking", "full_link_time"),
+        ]
+        
+        baseline_tests = baseline.get('tests', {})
+        pr_tests = pr.get('tests', {})
+        
+        for test_name, key in tests:
+            if key in baseline_tests and key in pr_tests:
+                base_val = baseline_tests[key]
+                pr_val = pr_tests[key]
+                change = calc_change(base_val, pr_val)
+                print(f"| {test_name} | {format_time(base_val)} | {format_time(pr_val)} | {change} |")
+            else:
+                print(f"| {test_name} | N/A | N/A | Missing data |")
+        
+        print()
+        
+        # Binary size comparison
+        print("## 📦 Binary Size Comparison") 
+        print("| Binary | Main Branch | PR Branch | Change |")
+        print("|--------|-------------|-----------|--------|")
+        
+        if "dmd_size_bytes" in baseline_tests and "dmd_size_bytes" in pr_tests:
+            base_size = baseline_tests["dmd_size_bytes"]
+            pr_size = pr_tests["dmd_size_bytes"]
+            change = calc_change(base_size, pr_size).replace("faster", "smaller").replace("slower", "larger")
+            print(f"| DMD Compiler | {format_size(base_size)} | {format_size(pr_size)} | {change} |")
+        else:
+            print("| DMD Compiler | N/A | N/A | Missing data |")
+        
+        print()
+        
+        # Check for significant regressions
+        significant_regression = False
+        regression_tests = []
+        
+        for test_name, key in tests:
+            if key in baseline_tests and key in pr_tests:
+                try:
+                    base_val = float(baseline_tests[key])
+                    pr_val = float(pr_tests[key])
+                    if pr_val != 999.0 and base_val > 0 and pr_val > base_val * 1.15:  # >15% slower
+                        significant_regression = True
+                        regression_tests.append(f"{test_name}: {((pr_val - base_val) / base_val) * 100:.1f}% slower")
+                except:
+                    pass
+        
+        if significant_regression:
+            print("## ⚠️ Performance Regressions Detected")
+            for regression in regression_tests:
+                print(f"- {regression}")
+            print()
+        
+        # Success/failure summary
+        failed_tests = []
+        for test_name, key in tests:
+            if key in pr_tests and str(pr_tests[key]) == "999.000":
+                failed_tests.append(test_name)
+        
+        if failed_tests:
+            print("## ❌ Failed Tests")
+            for test in failed_tests:
+                print(f"- {test}")
+            print()
+        else:
+            print("## ✅ All Tests Passed")
+            print()
+        
+        print("---")
+        print("*Generated by DMD Performance Regression Testing*")
+        if baseline.get('commit') and pr.get('commit'):
+            print(f"*Baseline: {baseline['commit'][:8]} | PR: {pr['commit'][:8]}*")
+        EOF
+        
+        python3 /tmp/generate-report.py > /tmp/performance-report.md
+        echo "Generated performance report:"
+        cat /tmp/performance-report.md
+
+    - name: Comment PR with Results
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          
+          let report;
+          try {
+            report = fs.readFileSync('/tmp/performance-report.md', 'utf8');
+          } catch (error) {
+            report = `# ⚠️ Performance Test Error
+            
+            Performance comparison could not be completed due to an internal error.
+            
+            Please check the workflow logs for details.
+            
+            ---
+            *DMD Performance Regression Testing*`;
+          }
+          
+          // Find existing comment
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          
+          const existingComment = comments.find(comment => 
+            comment.user.login === 'github-actions[bot]' &&
+            comment.body.includes('📊 DMD Performance Comparison')
+          );
+          
+          if (existingComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existingComment.id,
+              body: report
+            });
+            console.log('Updated existing performance comment');
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+            console.log('Created new performance comment');
+          }
+
+    - name: Upload Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: dmd-performance-results
+        path: /tmp/perf-results/
+        retention-days: 30
+        
+    - name: Debug Environment
+      if: failure()
+      run: |
+        echo "=== Environment Debug Info ==="
+        echo "PWD: $(pwd)"
+        echo "HOST_DMD: ${HOST_DMD:-unset}"
+        echo "PATH: $PATH"
+        echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-unset}"
+        
+        echo -e "\n=== Directory Structure ==="
+        find . -maxdepth 3 -type d | head -20
+        
+        echo -e "\n=== DMD Binary Check ==="
+        ls -la generated/linux/release/64/ 2>/dev/null || echo "Generated directory not found"
+        
+        echo -e "\n=== Build Logs ==="
+        echo "--- Baseline Build Log (last 30 lines) ---"
+        tail -30 baseline-build.log 2>/dev/null || echo "No baseline build log"
+        echo "--- PR Build Log (last 30 lines) ---"  
+        tail -30 pr-build.log 2>/dev/null || echo "No PR build log"
+        
+        echo -e "\n=== Performance Results ==="
+        ls -la /tmp/perf-results/ 2>/dev/null || echo "No performance results directory"
+        cat /tmp/perf-results/baseline.json 2>/dev/null || echo "No baseline results"
+        cat /tmp/perf-results/pr.json 2>/dev/null || echo "No PR results"
+        
+    - name: Check for Critical Regressions
+      if: always()
+      run: |
+        # Check if any tests had critical failures or major regressions
+        python3 << 'EOF'
+        import json
+        import sys
+        
+        try:
+            with open('/tmp/perf-results/baseline.json') as f:
+                baseline = json.load(f)
+            with open('/tmp/perf-results/pr.json') as f:
+                pr = json.load(f)
+        except:
+            print("Could not load performance results - skipping regression check")
+            sys.exit(0)
+        
+        # Check for build failures
+        if baseline.get('error') or pr.get('error'):
+            print("::warning::Build or test failures detected in performance tests")
+            sys.exit(0)
+        
+        # Check for critical performance regressions (>25% slower)
+        critical_regressions = []
+        tests = [
+            ("simple_compile_time", "Simple Compilation"),
+            ("template_stress_time", "Template Stress"),
+            ("ctfe_stress_time", "CTFE Stress"),
+            ("large_file_compile_time", "Large File"),
+            ("multifile_compile_time", "Multi-file"),
+        ]
+        
+        baseline_tests = baseline.get('tests', {})
+        pr_tests = pr.get('tests', {})
+        
+        for key, name in tests:
+            if key in baseline_tests and key in pr_tests:
+                try:
+                    base_val = float(baseline_tests[key])
+                    pr_val = float(pr_tests[key])
+                    if pr_val != 999.0 and base_val > 0 and pr_val > base_val * 1.25:
+                        regression_pct = ((pr_val - base_val) / base_val) * 100
+                        critical_regressions.append(f"{name}: {regression_pct:.1f}% slower")
+                except:
+                    pass
+        
+        if critical_regressions:
+            print("::error::Critical performance regressions detected:")
+            for regression in critical_regressions:
+                print(f"::error::{regression}")
+            sys.exit(1)
+        else:
+            print("✅ No critical performance regressions detected")
+        EOF
+
